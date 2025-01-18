@@ -88,6 +88,7 @@ POST:
     "top_p": 0.6,
     "temperature": 0.6,
     "speed": 1,
+    "cutl": 15,
     "inp_refs": ["456.wav","789.wav"]
 }
 ```
@@ -533,20 +534,34 @@ def read_clean_buffer(audio_bytes):
     return audio_bytes, audio_chunk
 
 
-def cut_text(text, punc):
-    punc_list = [p for p in punc if p in {",", ".", ";", "?", "!", "、", "，", "。", "？", "！", "；", "：", "…"}]
+def cut_text(text, punc, cutl):
+    punc_list = set(["\\"+p if re.match("[\.\+\*\?\^\$\(\)\[\]\{\}\|\,]",p) else p for p in punc if p in {x for x in default_cut_punc}])
     if len(punc_list) > 0:
-        punds = r"[" + "".join(punc_list) + r"]"
-        text = text.strip("\n")
-        items = re.split(f"({punds})", text)
-        mergeitems = ["".join(group) for group in zip(items[::2], items[1::2])]
-        # 在句子不存在符号或句尾无符号的时候保证文本完整
-        if len(items)%2 == 1:
-            mergeitems.append(items[-1])
-        text = "\n".join(mergeitems)
-
-    while "\n\n" in text:
-        text = text.replace("\n\n", "\n")
+        while "\r" in text:
+            text = text.replace("\r", "")
+        while "\n\n" in text:
+            text = text.replace("\n\n", "\n")
+        text = text.strip()
+        #多个连续分隔符当作一个分隔符来划分句子
+        punds_expr = r"[" + "".join(punc_list) + r"\n]+"
+        items = re.split(punds_expr, text)
+        #替换句子结尾的标点符号为.可以降低漏掉的概率
+        mergeitems = [" "+word.strip()+"," if word else "" for word in items]
+        temp=""
+        new_list=[]
+        for x in mergeitems:
+            if(len(temp)<cutl):
+                temp+=x
+            if(len(temp)>=cutl):
+                new_list.append(temp)
+                temp=""
+        if(len(new_list)>0 and 0<len(temp)<cutl):
+            new_list[-1]+=temp
+        elif(temp!=""):
+            new_list.append(temp)
+        text = "\n".join(new_list)
+    textf = [f"{lno+1} " + words + "\n" for lno, words in enumerate(new_list)]
+    logger.info(f"Final text: \n{''.join(textf)}\n")
 
     return text
 
@@ -556,7 +571,7 @@ def only_punc(text):
 
 
 splits = {"，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…", }
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, inp_refs = None, spk = "default"):
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, cutl = 15, inp_refs = None, spk = "default"):
     infer_sovits = speaker_list[spk].sovits
     vq_model = infer_sovits.vq_model
     hps = infer_sovits.hps
@@ -688,7 +703,7 @@ def handle_change(path, text, language):
     return JSONResponse({"code": 0, "message": "Success"}, status_code=200)
 
 
-def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, inp_refs):
+def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, inp_refs):
     if (
             refer_wav_path == "" or refer_wav_path is None
             or prompt_text == "" or prompt_text is None
@@ -703,11 +718,11 @@ def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cu
             return JSONResponse({"code": 400, "message": "未指定参考音频且接口无预设"}, status_code=400)
 
     if cut_punc == None:
-        text = cut_text(text,default_cut_punc)
+        text = cut_text(text,default_cut_punc,cutl)
     else:
-        text = cut_text(text,cut_punc)
+        text = cut_text(text,cut_punc,cutl)
 
-    return StreamingResponse(get_tts_wav(refer_wav_path, prompt_text, prompt_language, text, text_language, top_k, top_p, temperature, speed, inp_refs), media_type="audio/"+media_type)
+    return StreamingResponse(get_tts_wav(refer_wav_path, prompt_text, prompt_language, text, text_language, top_k, top_p, temperature, speed, cutl, inp_refs), media_type="audio/"+media_type)
 
 
 
@@ -765,7 +780,7 @@ parser.add_argument("-hp", "--half_precision", action="store_true", default=Fals
 parser.add_argument("-sm", "--stream_mode", type=str, default="close", help="流式返回模式, close / normal / keepalive")
 parser.add_argument("-mt", "--media_type", type=str, default="wav", help="音频编码格式, wav / ogg / aac")
 parser.add_argument("-st", "--sub_type", type=str, default="int16", help="音频数据类型, int16 / int32")
-parser.add_argument("-cp", "--cut_punc", type=str, default="", help="文本切分符号设定, 符号范围,.;?!、，。？！；：…")
+parser.add_argument("-cp", "--cut_punc", type=str, default="。,，;；:：?？!！<《>》(（)）[【]】`·、…~{}\"“”\'‘’ ", help="文本切分符号设定, 符号范围,.;?等")
 # 切割常用分句符为 `python ./api.py -cp ".?!。？！"`
 parser.add_argument("-hb", "--hubert_path", type=str, default=g_config.cnhubert_path, help="覆盖config.cnhubert_path")
 parser.add_argument("-b", "--bert_path", type=str, default=g_config.bert_path, help="覆盖config.bert_path")
@@ -915,6 +930,7 @@ async def tts_endpoint(request: Request):
         json_post_raw.get("top_p", 1.0),
         json_post_raw.get("temperature", 1.0),
         json_post_raw.get("speed", 1.0),
+        json_post_raw.get("cutl", 15),
         json_post_raw.get("inp_refs", [])
     )
 
@@ -931,9 +947,10 @@ async def tts_endpoint(
         top_p: float = 1.0,
         temperature: float = 1.0,
         speed: float = 1.0,
+        cutl: int = 15,
         inp_refs: list = Query(default=[])
 ):
-    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, inp_refs)
+    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, inp_refs)
 
 
 if __name__ == "__main__":
