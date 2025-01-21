@@ -89,6 +89,7 @@ POST:
     "temperature": 0.6,
     "speed": 1,
     "cutl": 15,
+    "eq": 1,
     "inp_refs": ["456.wav","789.wav"]
 }
 ```
@@ -426,19 +427,19 @@ def get_spepc(hps, filename):
     return spec
 
 
-def pack_audio(audio_bytes, data, rate):
+def pack_audio(audio_bytes, data, rate, eq):
     if media_type == "ogg":
-        audio_bytes = pack_ogg(audio_bytes, data, rate)
+        audio_bytes = pack_ogg(audio_bytes, data, rate, eq)
     elif media_type == "aac":
-        audio_bytes = pack_aac(audio_bytes, data, rate)
+        audio_bytes = pack_aac(audio_bytes, data, rate, eq)
     else:
         # wav无法流式, 先暂存raw
-        audio_bytes = pack_raw(audio_bytes, data, rate)
+        audio_bytes = pack_raw(audio_bytes, data, rate, eq)
 
     return audio_bytes
 
 
-def pack_ogg(audio_bytes, data, rate):
+def pack_ogg(audio_bytes, data, rate, eq):
     # Author: AkagawaTsurunaki
     # Issue:
     #   Stack overflow probabilistically occurs
@@ -483,13 +484,13 @@ def pack_ogg(audio_bytes, data, rate):
     return audio_bytes
 
 
-def pack_raw(audio_bytes, data, rate):
+def pack_raw(audio_bytes, data, rate, eq):
     audio_bytes.write(data.tobytes())
 
     return audio_bytes
 
 
-def pack_wav(audio_bytes, rate):
+def pack_wav(audio_bytes, rate, eq):
     if is_int32:
         data = np.frombuffer(audio_bytes.getvalue(),dtype=np.int32)
         wav_bytes = BytesIO()
@@ -501,7 +502,7 @@ def pack_wav(audio_bytes, rate):
     return wav_bytes
 
 
-def pack_aac(audio_bytes, data, rate):
+def pack_aac(audio_bytes, data, rate, eq):
     if is_int32:
         pcm = 's32le'
         bit_rate = '256k'
@@ -514,6 +515,10 @@ def pack_aac(audio_bytes, data, rate):
         '-ar', str(rate),  # 设置采样率
         '-ac', '1',  # 单声道
         '-i', 'pipe:0',  # 从管道读取输入
+        '-af',
+        ''
+        +f"volume={eq}" #音量倍率
+        ,
         '-c:a', 'aac',  # 音频编码器为AAC
         '-b:a', bit_rate,  # 比特率
         '-vn',  # 不包含视频
@@ -571,7 +576,7 @@ def only_punc(text):
 
 
 splits = {"，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…", }
-def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, cutl = 15, inp_refs = None, spk = "default"):
+def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language, top_k= 15, top_p = 0.6, temperature = 0.6, speed = 1, cutl = 15, eq = 1, inp_refs = None, spk = "default"):
     infer_sovits = speaker_list[spk].sovits
     vq_model = infer_sovits.vq_model
     hps = infer_sovits.hps
@@ -660,9 +665,9 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         audio_opt.append(zero_wav)
         t4 = ttime()
         if is_int32:
-            audio_bytes = pack_audio(audio_bytes,(np.concatenate(audio_opt, 0) * 2147483647).astype(np.int32),hps.data.sampling_rate)
+            audio_bytes = pack_audio(audio_bytes,(np.concatenate(audio_opt, 0) * 2147483647).astype(np.int32),hps.data.sampling_rate, eq)
         else:
-            audio_bytes = pack_audio(audio_bytes,(np.concatenate(audio_opt, 0) * 32768).astype(np.int16),hps.data.sampling_rate)
+            audio_bytes = pack_audio(audio_bytes,(np.concatenate(audio_opt, 0) * 32768).astype(np.int16),hps.data.sampling_rate, eq)
     # logger.info("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t3 - t2, t4 - t3))
         if stream_mode == "normal":
             audio_bytes, audio_chunk = read_clean_buffer(audio_bytes)
@@ -670,7 +675,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     
     if not stream_mode == "normal": 
         if media_type == "wav":
-            audio_bytes = pack_wav(audio_bytes,hps.data.sampling_rate)
+            audio_bytes = pack_wav(audio_bytes,hps.data.sampling_rate, eq)
         yield audio_bytes.getvalue()
 
 
@@ -703,7 +708,7 @@ def handle_change(path, text, language):
     return JSONResponse({"code": 0, "message": "Success"}, status_code=200)
 
 
-def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, inp_refs):
+def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, eq, inp_refs):
     if (
             refer_wav_path == "" or refer_wav_path is None
             or prompt_text == "" or prompt_text is None
@@ -722,7 +727,7 @@ def handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cu
     else:
         text = cut_text(text,cut_punc,cutl)
 
-    return StreamingResponse(get_tts_wav(refer_wav_path, prompt_text, prompt_language, text, text_language, top_k, top_p, temperature, speed, cutl, inp_refs), media_type="audio/"+media_type)
+    return StreamingResponse(get_tts_wav(refer_wav_path, prompt_text, prompt_language, text, text_language, top_k, top_p, temperature, speed, cutl, eq, inp_refs), media_type="audio/"+media_type)
 
 
 
@@ -931,6 +936,7 @@ async def tts_endpoint(request: Request):
         json_post_raw.get("temperature", 1.0),
         json_post_raw.get("speed", 1.0),
         json_post_raw.get("cutl", 15),
+        json_post_raw.get("eq", 1),
         json_post_raw.get("inp_refs", [])
     )
 
@@ -948,9 +954,10 @@ async def tts_endpoint(
         temperature: float = 1.0,
         speed: float = 1.0,
         cutl: int = 15,
+        eq: float = 1,
         inp_refs: list = Query(default=[])
 ):
-    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, inp_refs)
+    return handle(refer_wav_path, prompt_text, prompt_language, text, text_language, cut_punc, top_k, top_p, temperature, speed, cutl, eq, inp_refs)
 
 
 if __name__ == "__main__":
